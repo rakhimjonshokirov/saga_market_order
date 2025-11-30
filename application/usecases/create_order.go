@@ -4,16 +4,24 @@ import (
 	"context"
 	"fmt"
 
+	"market_order/application/aggregates"
 	"market_order/domain/order"
-	"market_order/infrastructure/repository"
 )
 
+// CreateOrderUseCase creates a new order
+//
+// IMPORTANT:
+// - Uses aggregateStore (NOT repository!)
+// - Creates new aggregate
+// - Generates OrderAccepted event
+// - Saves to EventStore
+// - NO direct database access
 type CreateOrderUseCase struct {
-	orderRepo *repository.OrderRepository
+	aggregateStore *aggregates.AggregateStore // ✅ Source of truth
 }
 
-func NewCreateOrderUseCase(repo *repository.OrderRepository) *CreateOrderUseCase {
-	return &CreateOrderUseCase{orderRepo: repo}
+func NewCreateOrderUseCase(aggregateStore *aggregates.AggregateStore) *CreateOrderUseCase {
+	return &CreateOrderUseCase{aggregateStore: aggregateStore}
 }
 
 type CreateOrderRequest struct {
@@ -26,10 +34,10 @@ type CreateOrderRequest struct {
 }
 
 func (uc *CreateOrderUseCase) Execute(ctx context.Context, req CreateOrderRequest) error {
-	// Создаём новый агрегат
+	// ✅ Create new aggregate
 	o := order.NewOrder()
 
-	// Выполняем команду
+	// ✅ Execute command (generates OrderAccepted event)
 	err := o.AcceptOrder(
 		req.OrderID,
 		req.UserID,
@@ -42,8 +50,15 @@ func (uc *CreateOrderUseCase) Execute(ctx context.Context, req CreateOrderReques
 		return err
 	}
 
-	fmt.Println("event accept order: ", o)
+	fmt.Println("✅ OrderAccepted event generated:", req.OrderID)
 
-	// Сохраняем события (Event Store + Outbox)
-	return uc.orderRepo.Save(ctx, o)
+	// ✅ Save events to EventStore (NOT repository!)
+	if err := uc.aggregateStore.SaveOrderAggregate(ctx, o); err != nil {
+		return fmt.Errorf("failed to save order events: %w", err)
+	}
+
+	// Events are automatically published via Outbox pattern
+	// OrderProjection will create database record independently
+
+	return nil
 }

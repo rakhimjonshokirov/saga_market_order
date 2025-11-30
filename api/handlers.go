@@ -11,25 +11,21 @@ import (
 
 	"market_order/application/usecases"
 	"market_order/infrastructure/eventstore"
-	"market_order/infrastructure/repository"
 	pkguuid "market_order/pkg/uuid"
 )
 
 // OrderHandler handles HTTP requests for orders
 type OrderHandler struct {
 	createOrderUC *usecases.CreateOrderUseCase
-	orderRepo     *repository.OrderRepository
-	eventStore    eventstore.EventStore
+	eventStore    eventstore.EventStore // For reading event history
 }
 
 func NewOrderHandler(
 	createOrderUC *usecases.CreateOrderUseCase,
-	orderRepo *repository.OrderRepository,
 	eventStore eventstore.EventStore,
 ) *OrderHandler {
 	return &OrderHandler{
 		createOrderUC: createOrderUC,
-		orderRepo:     orderRepo,
 		eventStore:    eventStore,
 	}
 }
@@ -126,18 +122,18 @@ func HealthCheck(w http.ResponseWriter, r *http.Request) {
 
 // OrderHistoryResponse is the response for order history
 type OrderHistoryResponse struct {
-	OrderID       string              `json:"order_id"`
-	UserID        string              `json:"user_id"`
-	FromAmount    float64             `json:"from_amount"`
-	FromCurrency  string              `json:"from_currency"`
-	ToCurrency    string              `json:"to_currency"`
-	ToAmount      float64             `json:"to_amount"`
-	ExecutedPrice float64             `json:"executed_price"`
-	OrderType     string              `json:"order_type"`
-	Status        string              `json:"status"`
-	CreatedAt     time.Time           `json:"created_at"`
-	UpdatedAt     time.Time           `json:"updated_at"`
-	Timeline      []TimelineEvent     `json:"timeline"`
+	OrderID       string          `json:"order_id"`
+	UserID        string          `json:"user_id"`
+	FromAmount    float64         `json:"from_amount"`
+	FromCurrency  string          `json:"from_currency"`
+	ToCurrency    string          `json:"to_currency"`
+	ToAmount      float64         `json:"to_amount"`
+	ExecutedPrice float64         `json:"executed_price"`
+	OrderType     string          `json:"order_type"`
+	Status        string          `json:"status"`
+	CreatedAt     time.Time       `json:"created_at"`
+	UpdatedAt     time.Time       `json:"updated_at"`
+	Timeline      []TimelineEvent `json:"timeline"`
 }
 
 // TimelineEvent represents a single event in order history
@@ -168,24 +164,85 @@ func (h *OrderHandler) GetOrderHistory(w http.ResponseWriter, r *http.Request) {
 
 	ctx := context.Background()
 
-	// Load order aggregate (reconstructed from events)
-	order, err := h.orderRepo.Get(ctx, orderID)
-	if err != nil {
-		if err.Error() == "order not found" {
-			http.Error(w, "Order not found", http.StatusNotFound)
-			return
-		}
-		log.Printf("Failed to load order: %v", err)
-		http.Error(w, "Failed to load order", http.StatusInternalServerError)
-		return
-	}
-
-	// Load all events for timeline
+	// Load all events for timeline (from EventStore - source of truth)
 	events, err := h.eventStore.Load(ctx, orderID)
 	if err != nil {
 		log.Printf("Failed to load events: %v", err)
 		http.Error(w, "Failed to load order history", http.StatusInternalServerError)
 		return
+	}
+
+	if len(events) == 0 {
+		http.Error(w, "Order not found", http.StatusNotFound)
+		return
+	}
+
+	// Extract order summary from events (aggregate state)
+	var (
+		userID        string
+		fromAmount    float64
+		fromCurrency  string
+		toCurrency    string
+		toAmount      float64
+		executedPrice float64
+		orderType     string
+		status        string
+		createdAt     time.Time
+		updatedAt     time.Time
+	)
+
+	// Parse first event (OrderAccepted) for basic info
+	var firstEvent map[string]interface{}
+	if err := json.Unmarshal(events[0].EventData, &firstEvent); err == nil {
+		userID, _ = firstEvent["user_id"].(string)
+		fromAmount, _ = firstEvent["from_amount"].(float64)
+		fromCurrency, _ = firstEvent["from_currency"].(string)
+		toCurrency, _ = firstEvent["to_currency"].(string)
+		orderType, _ = firstEvent["order_type"].(string)
+		status = "pending"
+		createdAt, _ = time.Parse(time.RFC3339, events[0].CreatedAt)
+	}
+
+	// Parse last event for latest state
+	lastEvent := events[len(events)-1]
+	updatedAt, _ = time.Parse(time.RFC3339, lastEvent.CreatedAt)
+
+	// Update state based on event type
+	for _, evt := range events {
+		var eventData map[string]interface{}
+		json.Unmarshal(evt.EventData, &eventData)
+
+		switch evt.EventType {
+		case "PriceQuoted":
+			if p, ok := eventData["price"].(float64); ok {
+				executedPrice = p
+			}
+			if ta, ok := eventData["to_amount"].(float64); ok {
+				toAmount = ta
+			}
+		case "SwapExecuting":
+			status = "executing"
+		case "SwapExecuted":
+			if ta, ok := eventData["to_amount"].(float64); ok {
+				toAmount = ta
+			}
+			if p, ok := eventData["executed_price"].(float64); ok {
+				executedPrice = p
+			}
+		case "OrderCompleted":
+			status = "completed"
+			if fa, ok := eventData["from_amount"].(float64); ok {
+				fromAmount = fa
+			}
+			if ta, ok := eventData["to_amount"].(float64); ok {
+				toAmount = ta
+			}
+			if p, ok := eventData["executed_price"].(float64); ok {
+				executedPrice = p
+			}
+		case "OrderFailed":
+			status = "failed"
+		}
 	}
 
 	// Build timeline from events
@@ -239,19 +296,19 @@ func (h *OrderHandler) GetOrderHistory(w http.ResponseWriter, r *http.Request) {
 		timeline = append(timeline, timelineEvent)
 	}
 
-	// Build response
+	// Build response (from events - source of truth)
 	response := OrderHistoryResponse{
-		OrderID:       order.ID,
-		UserID:        order.UserID,
-		FromAmount:    order.FromAmount,
-		FromCurrency:  order.FromCurrency,
-		ToCurrency:    order.ToCurrency,
-		ToAmount:      order.ToAmount,
-		ExecutedPrice: order.ExecutedPrice,
-		OrderType:     order.OrderType,
-		Status:        string(order.Status),
-		CreatedAt:     order.CreatedAt,
-		UpdatedAt:     order.UpdatedAt,
+		OrderID:       orderID,
+		UserID:        userID,
+		FromAmount:    fromAmount,
+		FromCurrency:  fromCurrency,
+		ToCurrency:    toCurrency,
+		ToAmount:      toAmount,
+		ExecutedPrice: executedPrice,
+		OrderType:     orderType,
+		Status:        status,
+		CreatedAt:     createdAt,
+		UpdatedAt:     updatedAt,
 		Timeline:      timeline,
 	}
 

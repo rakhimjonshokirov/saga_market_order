@@ -209,3 +209,29 @@ type OrderPartiallyFilled struct {
 func (e OrderPartiallyFilled) GetBaseEvent() eventstore.BaseFields {
 	return e.BaseEvent.GetBaseFields()
 }
+
+// ===============================================
+// Saga Step Events
+// ===============================================
+
+// PositionCreatedForOrder - событие: позиция создана для ордера (saga step)
+type PositionCreatedForOrder struct {
+	BaseEvent
+	PositionID string `json:"position_id"`
+	UserID     string `json:"user_id"`
+}
+
+func (e PositionCreatedForOrder) GetBaseEvent() eventstore.BaseFields {
+	return e.BaseEvent.GetBaseFields()
+}
+
+// PositionLinkedToOrder - событие: позиция привязана к ордеру (saga step)
+type PositionLinkedToOrder struct {
+	BaseEvent
+	PositionID string `json:"position_id"`
+	OrderID    string `json:"order_id"`
+}
+
+func (e PositionLinkedToOrder) GetBaseEvent() eventstore.BaseFields {
+	return e.BaseEvent.GetBaseFields()
+}

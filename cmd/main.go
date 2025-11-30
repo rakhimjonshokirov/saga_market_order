@@ -13,6 +13,7 @@ import (
 	_ "github.com/lib/pq"
 
 	"market_order/api"
+	"market_order/application/aggregates"
 	"market_order/application/notification"
 	"market_order/application/saga"
 	"market_order/application/usecases"
@@ -91,21 +92,23 @@ func main() {
 	log.Println("✅ Idempotency repository initialized")
 
 	// =====================================================
-	// 3. Repositories
+	// 3. Repositories (EventStore ONLY - source of truth)
 	// =====================================================
 	orderRepo := repository.NewOrderRepository(es)
 	positionRepo := repository.NewPositionRepository(es)
-	log.Println("✅ Repositories initialized")
+	log.Println("✅ Repositories initialized (EventStore)")
 
 	// =====================================================
-	// 4. Use Cases
+	// 4. Aggregate Store (for commands and queries)
 	// =====================================================
-	createOrderUC := usecases.NewCreateOrderUseCase(orderRepo)
-	completeOrderAndPosUC := usecases.NewCompleteOrderAndUpdatePositionUseCase(
-		orderRepo,
-		positionRepo,
-		es, // Pass event store for atomic transaction
-	)
+	aggregateStore := aggregates.NewAggregateStore(es)
+	log.Println("✅ Aggregate Store initialized")
+
+	// =====================================================
+	// 5. Use Cases (using AggregateStore)
+	// =====================================================
+	createOrderUC := usecases.NewCreateOrderUseCase(aggregateStore)
+	completeOrderAndPosUC := usecases.NewCompleteOrderAndUpdatePositionUseCase(aggregateStore)
 	log.Println("✅ Use cases initialized")
 
 	// =====================================================
@@ -117,13 +120,11 @@ func main() {
 	log.Println("✅ External services initialized (mock)")
 
 	// =====================================================
-	// 6. Saga Orchestrator
+	// 6. Saga Orchestrator (using AggregateStore)
 	// =====================================================
-	orderSaga := saga.NewOrderSaga(
-		orderRepo,
-		positionRepo,
+	orderSaga := saga.NewOrderSagaRefactored(
+		aggregateStore,
 		processedEventsRepo,
-		createOrderUC,
 		completeOrderAndPosUC,
 		mb,
 		priceService,
@@ -132,7 +133,7 @@ func main() {
 	log.Println("✅ Saga orchestrator initialized")
 
 	// =====================================================
-	// 7. Notification Service
+	// 7. Notification Service (using EventStore for queries)
 	// =====================================================
 	notificationService := notification.NewNotificationService(
 		orderRepo,
@@ -152,7 +153,7 @@ func main() {
 	// =====================================================
 	// 9. API Server
 	// =====================================================
-	orderHandler := api.NewOrderHandler(createOrderUC, orderRepo, es)
+	orderHandler := api.NewOrderHandler(createOrderUC, es)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", api.HealthCheck)

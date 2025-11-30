@@ -13,9 +13,10 @@ import (
 )
 
 // NotificationService listens to domain events and sends notifications
+// Reads data from EventStore (source of truth) - NO projections!
 type NotificationService struct {
-	orderRepo       *repository.OrderRepository
-	positionRepo    *repository.PositionRepository
+	orderRepo       *repository.OrderRepository    // EventStore
+	positionRepo    *repository.PositionRepository // EventStore
 	processedEvents *idempotency.ProcessedEventsRepository
 	messageBus      *messaging.RabbitMQ
 	notifier        Notifier

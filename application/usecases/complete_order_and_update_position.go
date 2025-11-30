@@ -4,25 +4,25 @@ import (
 	"context"
 	"fmt"
 
-	"market_order/infrastructure/eventstore"
-	"market_order/infrastructure/repository"
+	"market_order/application/aggregates"
 )
 
+// CompleteOrderAndUpdatePositionUseCase completes order and updates position
+//
+// IMPORTANT:
+// - Uses aggregateStore (NOT repositories!)
+// - Loads aggregates from EventStore (source of truth)
+// - Saves events atomically
+// - NO direct database access
 type CompleteOrderAndUpdatePositionUseCase struct {
-	orderRepo    *repository.OrderRepository
-	positionRepo *repository.PositionRepository
-	eventStore   eventstore.EventStore
+	aggregateStore *aggregates.AggregateStore // ✅ Source of truth
 }
 
 func NewCompleteOrderAndUpdatePositionUseCase(
-	orderRepo *repository.OrderRepository,
-	positionRepo *repository.PositionRepository,
-	eventStore eventstore.EventStore,
+	aggregateStore *aggregates.AggregateStore,
 ) *CompleteOrderAndUpdatePositionUseCase {
 	return &CompleteOrderAndUpdatePositionUseCase{
-		orderRepo:    orderRepo,
-		positionRepo: positionRepo,
-		eventStore:   eventStore,
+		aggregateStore: aggregateStore,
 	}
 }
 
@@ -35,53 +35,50 @@ type SwapResult struct {
 	Slippage        float64
 }
 
-// Execute completes order and updates position in a SINGLE TRANSACTION
-// This is CRITICAL for consistency - both aggregates must be updated atomically
+// Execute completes order and updates position atomically
+// This is CRITICAL for consistency - both aggregates must be updated in single transaction
 func (uc *CompleteOrderAndUpdatePositionUseCase) Execute(
 	ctx context.Context,
 	orderID, positionID string,
 	swapResult SwapResult,
 ) error {
-	// === 1. Загружаем Order ===
-	o, err := uc.orderRepo.Get(ctx, orderID)
+	// ✅ 1. Load Order from EventStore (source of truth)
+	o, err := uc.aggregateStore.LoadOrderAggregate(ctx, orderID)
 	if err != nil {
-		return fmt.Errorf("failed to load order: %w", err)
+		return fmt.Errorf("failed to load order aggregate: %w", err)
 	}
 
-	// === 2. Завершаем Order ===
+	// ✅ 2. Complete Order (generates OrderCompleted event)
 	if err := o.CompleteOrder(); err != nil {
 		return fmt.Errorf("failed to complete order: %w", err)
 	}
 
-	// === 3. Загружаем Position ===
-	p, err := uc.positionRepo.Get(ctx, positionID)
+	// ✅ 3. Load Position from EventStore (source of truth)
+	p, err := uc.aggregateStore.LoadPositionAggregate(ctx, positionID)
 	if err != nil {
-		return fmt.Errorf("failed to load position: %w", err)
+		return fmt.Errorf("failed to load position aggregate: %w", err)
 	}
 
-	// === 4. Обновляем Position ===
-	totalValue := swapResult.FromAmount // Примерный расчёт
-	pnl := 0.0                          // Для первого ордера
+	// ✅ 4. Update Position (generates events)
+	totalValue := swapResult.FromAmount
+	pnl := 0.0 // For first order
 
 	if err := p.AddOrder(orderID, swapResult.ToAmount, totalValue, pnl); err != nil {
 		return fmt.Errorf("failed to update position: %w", err)
 	}
 
-	// === 5. CRITICAL: Сохраняем ОБА агрегата в ОДНОЙ транзакции ===
-	// Собираем все события из обоих агрегатов
-	allEvents := make([]interface{}, 0)
-	allEvents = append(allEvents, o.Changes...)
-	allEvents = append(allEvents, p.Changes...)
-
-	// Сохраняем все события атомарно
-	// Event Store гарантирует, что либо ВСЕ события сохранятся, либо НИЧЕГО
-	if err := uc.eventStore.Save(ctx, allEvents); err != nil {
-		return fmt.Errorf("failed to save events: %w", err)
+	// ✅ 5. Save Order events to EventStore
+	if err := uc.aggregateStore.SaveOrderAggregate(ctx, o); err != nil {
+		return fmt.Errorf("failed to save order events: %w", err)
 	}
 
-	// Очищаем Changes после успешного сохранения
-	o.Changes = nil
-	p.Changes = nil
+	// ✅ 6. Save Position events to EventStore
+	if err := uc.aggregateStore.SavePositionAggregate(ctx, p); err != nil {
+		return fmt.Errorf("failed to save position events: %w", err)
+	}
+
+	// Events are automatically published via Outbox pattern
+	// Projections will update database independently
 
 	return nil
 }

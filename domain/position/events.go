@@ -1,8 +1,8 @@
 package position
 
 import (
-	"time"
 	"market_order/infrastructure/eventstore"
+	"time"
 )
 
 type BaseEvent struct {
