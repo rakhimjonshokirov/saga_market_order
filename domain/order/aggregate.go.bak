@@ -1,0 +1,290 @@
+package order
+
+import (
+	"errors"
+	"fmt"
+	"time"
+)
+
+// OrderStatus представляет статус заказа
+type OrderStatus string
+
+const (
+	OrderStatusPending   OrderStatus = "pending"
+	OrderStatusExecuting OrderStatus = "executing"
+	OrderStatusCompleted OrderStatus = "completed"
+	OrderStatusFailed    OrderStatus = "failed"
+)
+
+// Order - агрегат заказа
+type Order struct {
+	// Состояние
+	ID            string
+	UserID        string
+	FromAmount    float64
+	FromCurrency  string
+	ToCurrency    string
+	ToAmount      float64
+	ExecutedPrice float64
+	OrderType     string // "market" или "limit"
+	Status        OrderStatus
+	Version       int
+	CreatedAt     time.Time
+	UpdatedAt     time.Time
+
+	// Несохранённые события
+	Changes []interface{}
+}
+
+// NewOrder создаёт новый пустой заказ
+func NewOrder() *Order {
+	return &Order{
+		Changes: make([]interface{}, 0),
+	}
+}
+
+// When восстанавливает состояние из события (replay)
+func (o *Order) When(event interface{}) error {
+	switch e := event.(type) {
+
+	case OrderAccepted:
+		o.ID = e.AggregateID
+		o.UserID = e.UserID
+		o.FromAmount = e.FromAmount
+		o.FromCurrency = e.FromCurrency
+		o.ToCurrency = e.ToCurrency
+		o.OrderType = e.OrderType
+		o.Status = OrderStatusPending
+		o.Version = e.Version
+		o.CreatedAt = e.Timestamp
+		o.UpdatedAt = e.Timestamp
+
+	case PriceQuoted:
+		o.ToAmount = e.ToAmount
+		o.ExecutedPrice = e.Price
+		o.Version = e.Version
+		o.UpdatedAt = e.Timestamp
+
+	case SwapExecuting:
+		o.Status = OrderStatusExecuting
+		o.Version = e.Version
+		o.UpdatedAt = e.Timestamp
+
+	case SwapExecuted:
+		o.ToAmount = e.ToAmount
+		o.ExecutedPrice = e.ExecutedPrice
+		o.Version = e.Version
+		o.UpdatedAt = e.Timestamp
+
+	case OrderCompleted:
+		o.Status = OrderStatusCompleted
+		o.FromAmount = e.FromAmount
+		o.ToAmount = e.ToAmount
+		o.ExecutedPrice = e.ExecutedPrice
+		o.Version = e.Version
+		o.UpdatedAt = e.Timestamp
+
+	case OrderFailed:
+		o.Status = OrderStatusFailed
+		o.Version = e.Version
+		o.UpdatedAt = e.Timestamp
+
+	default:
+		return fmt.Errorf("unknown event type: %T", event)
+	}
+
+	return nil
+}
+
+// Apply применяет событие и добавляет в Changes
+func (o *Order) Apply(event interface{}) error {
+	if err := o.When(event); err != nil {
+		return err
+	}
+
+	o.Changes = append(o.Changes, event)
+	return nil
+}
+
+// AcceptOrder - команда: принять заказ
+func (o *Order) AcceptOrder(
+	orderID, userID string,
+	fromAmount float64,
+	fromCurrency, toCurrency string,
+	orderType string,
+) error {
+	// Бизнес-валидация
+	if fromAmount <= 0 {
+		return errors.New("from_amount must be positive")
+	}
+
+	if fromAmount < 10.0 {
+		return errors.New("minimum order amount is 10")
+	}
+
+	if orderType != "market" && orderType != "limit" {
+		return errors.New("order_type must be 'market' or 'limit'")
+	}
+
+	// Генерируем событие
+	event := OrderAccepted{
+		BaseEvent: BaseEvent{
+			EventID:       generateUUID(),
+			AggregateID:   orderID,
+			AggregateType: "Order",
+			EventType:     "OrderAccepted",
+			Version:       1,
+			Timestamp:     time.Now(),
+			Metadata: map[string]interface{}{
+				"user_agent": "api-v1",
+			},
+		},
+		UserID:       userID,
+		FromAmount:   fromAmount,
+		FromCurrency: fromCurrency,
+		ToCurrency:   toCurrency,
+		OrderType:    orderType,
+	}
+
+	return o.Apply(event)
+}
+
+// QuotePrice - команда: установить котировку
+func (o *Order) QuotePrice(price, toAmount float64) error {
+	// Бизнес-правила
+	if o.Status != OrderStatusPending {
+		return fmt.Errorf("cannot quote price: order status is %s", o.Status)
+	}
+
+	if price <= 0 || toAmount <= 0 {
+		return errors.New("price and toAmount must be positive")
+	}
+
+	event := PriceQuoted{
+		BaseEvent: BaseEvent{
+			EventID:       generateUUID(),
+			AggregateID:   o.ID,
+			AggregateType: "Order",
+			EventType:     "PriceQuoted",
+			Version:       o.Version + 1,
+			Timestamp:     time.Now(),
+		},
+		Price:          price,
+		ToAmount:       toAmount,
+		QuoteTimestamp: time.Now(),
+	}
+
+	return o.Apply(event)
+}
+
+// StartSwapExecution - команда: начать исполнение
+func (o *Order) StartSwapExecution(idempotencyKey string) error {
+	if o.Status != OrderStatusPending {
+		return fmt.Errorf("cannot start execution: order status is %s", o.Status)
+	}
+
+	event := SwapExecuting{
+		BaseEvent: BaseEvent{
+			EventID:       generateUUID(),
+			AggregateID:   o.ID,
+			AggregateType: "Order",
+			EventType:     "SwapExecuting",
+			Version:       o.Version + 1,
+			Timestamp:     time.Now(),
+		},
+		IdempotencyKey: idempotencyKey,
+	}
+
+	return o.Apply(event)
+}
+
+// RecordSwapExecution - команда: записать результат swap
+func (o *Order) RecordSwapExecution(
+	txHash string,
+	fromAmount, toAmount, executedPrice, fees, slippage float64,
+) error {
+	if o.Status != OrderStatusExecuting {
+		return fmt.Errorf("cannot record execution: order status is %s", o.Status)
+	}
+
+	event := SwapExecuted{
+		BaseEvent: BaseEvent{
+			EventID:       generateUUID(),
+			AggregateID:   o.ID,
+			AggregateType: "Order",
+			EventType:     "SwapExecuted",
+			Version:       o.Version + 1,
+			Timestamp:     time.Now(),
+		},
+		TransactionHash: txHash,
+		FromAmount:      fromAmount,
+		ToAmount:        toAmount,
+		ExecutedPrice:   executedPrice,
+		Fees:            fees,
+		Slippage:        slippage,
+	}
+
+	return o.Apply(event)
+}
+
+// CompleteOrder - команда: завершить заказ
+func (o *Order) CompleteOrder() error {
+	// Идемпотентность на бизнес-уровне
+	if o.Status == OrderStatusCompleted {
+		return nil // Уже завершён, ничего не делаем
+	}
+
+	if o.Status != OrderStatusExecuting {
+		return fmt.Errorf("cannot complete order: order status is %s", o.Status)
+	}
+
+	event := OrderCompleted{
+		BaseEvent: BaseEvent{
+			EventID:       generateUUID(),
+			AggregateID:   o.ID,
+			AggregateType: "Order",
+			EventType:     "OrderCompleted",
+			Version:       o.Version + 1,
+			Timestamp:     time.Now(),
+		},
+		FromAmount:    o.FromAmount,
+		ToAmount:      o.ToAmount,
+		ExecutedPrice: o.ExecutedPrice,
+		Status:        "completed",
+	}
+
+	return o.Apply(event)
+}
+
+// FailOrder - команда: провалить заказ (компенсация)
+func (o *Order) FailOrder(reason string) error {
+	// Идемпотентность
+	if o.Status == OrderStatusFailed {
+		return nil
+	}
+
+	if o.Status == OrderStatusCompleted {
+		return errors.New("cannot fail completed order")
+	}
+
+	event := OrderFailed{
+		BaseEvent: BaseEvent{
+			EventID:       generateUUID(),
+			AggregateID:   o.ID,
+			AggregateType: "Order",
+			EventType:     "OrderFailed",
+			Version:       o.Version + 1,
+			Timestamp:     time.Now(),
+		},
+		Reason:   reason,
+		FailedAt: time.Now(),
+	}
+
+	return o.Apply(event)
+}
+
+// Helper function
+func generateUUID() string {
+	// Используй github.com/google/uuid
+	return "uuid-" + time.Now().Format("20060102150405")
+}

@@ -1,0 +1,9 @@
+package order
+
+import (
+	pkguuid "market_order/pkg/uuid"
+)
+
+func generateUUID() string {
+	return pkguuid.New()
+}

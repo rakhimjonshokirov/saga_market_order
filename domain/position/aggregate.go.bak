@@ -1,0 +1,149 @@
+package position
+
+import (
+	"fmt"
+	"time"
+)
+
+type PositionStatus string
+
+const (
+	PositionStatusOpen   PositionStatus = "open"
+	PositionStatusClosed PositionStatus = "closed"
+)
+
+// Position - агрегат позиции
+type Position struct {
+	ID              string
+	UserID          string
+	OrderIDs        []string // Список ID заказов в позиции
+	RemainingAmount float64  // Оставшееся количество актива
+	TotalValue      float64  // Общая стоимость в USD
+	PnL             float64  // Прибыль/убыток
+	Status          PositionStatus
+	Version         int
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
+
+	Changes []interface{}
+}
+
+func NewPosition() *Position {
+	return &Position{
+		OrderIDs: make([]string, 0),
+		Changes:  make([]interface{}, 0),
+	}
+}
+
+// When восстанавливает состояние
+func (p *Position) When(event interface{}) error {
+	switch e := event.(type) {
+
+	case PositionCreated:
+		p.ID = e.AggregateID
+		p.UserID = e.UserID
+		p.RemainingAmount = e.RemainingAmount
+		p.Status = PositionStatus(e.Status)
+		p.Version = e.Version
+		p.CreatedAt = e.Timestamp
+		p.UpdatedAt = e.Timestamp
+
+	case PositionUpdated:
+		p.OrderIDs = append(p.OrderIDs, e.AddedOrderID)
+		p.RemainingAmount = e.RemainingAmount
+		p.TotalValue = e.TotalValue
+		p.PnL = e.PnL
+		p.Version = e.Version
+		p.UpdatedAt = e.Timestamp
+
+	case PositionClosed:
+		p.Status = PositionStatusClosed
+		p.Version = e.Version
+		p.UpdatedAt = e.Timestamp
+
+	default:
+		return fmt.Errorf("unknown event type: %T", event)
+	}
+
+	return nil
+}
+
+func (p *Position) Apply(event interface{}) error {
+	if err := p.When(event); err != nil {
+		return err
+	}
+	p.Changes = append(p.Changes, event)
+	return nil
+}
+
+// CreatePosition - команда: создать позицию
+func (p *Position) CreatePosition(positionID, userID string) error {
+	event := PositionCreated{
+		BaseEvent: BaseEvent{
+			EventID:       generateUUID(),
+			AggregateID:   positionID,
+			AggregateType: "Position",
+			EventType:     "PositionCreated",
+			Version:       1,
+			Timestamp:     time.Now(),
+		},
+		UserID:          userID,
+		RemainingAmount: 0,
+		Status:          "open",
+	}
+
+	return p.Apply(event)
+}
+
+// AddOrder - команда: добавить заказ в позицию
+func (p *Position) AddOrder(
+	orderID string,
+	toAmount, totalValue, pnl float64,
+) error {
+	if p.Status != PositionStatusOpen {
+		return fmt.Errorf("cannot add order: position is %s", p.Status)
+	}
+
+	event := PositionUpdated{
+		BaseEvent: BaseEvent{
+			EventID:       generateUUID(),
+			AggregateID:   p.ID,
+			AggregateType: "Position",
+			EventType:     "PositionUpdated",
+			Version:       p.Version + 1,
+			Timestamp:     time.Now(),
+		},
+		AddedOrderID:    orderID,
+		RemainingAmount: p.RemainingAmount + toAmount,
+		TotalValue:      totalValue,
+		PnL:             pnl,
+	}
+
+	return p.Apply(event)
+}
+
+// ClosePosition - команда: закрыть позицию (компенсация)
+func (p *Position) ClosePosition(reason string) error {
+	if p.Status == PositionStatusClosed {
+		return nil // Идемпотентность
+	}
+
+	event := PositionClosed{
+		BaseEvent: BaseEvent{
+			EventID:       generateUUID(),
+			AggregateID:   p.ID,
+			AggregateType: "Position",
+			EventType:     "PositionClosed",
+			Version:       p.Version + 1,
+			Timestamp:     time.Now(),
+		},
+		Reason:   reason,
+		ClosedAt: time.Now(),
+	}
+
+	return p.Apply(event)
+}
+
+func generateUUID() string {
+	return "uuid-" + time.Now().Format("20060102150405")
+}

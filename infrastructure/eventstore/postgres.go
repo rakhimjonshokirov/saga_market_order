@@ -1,0 +1,203 @@
+package eventstore
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+
+	_ "github.com/lib/pq"
+)
+
+// Event представляет сохранённое событие
+type Event struct {
+	ID            int64
+	EventID       string
+	AggregateID   string
+	AggregateType string
+	EventType     string
+	EventData     json.RawMessage
+	Metadata      json.RawMessage
+	Version       int
+	CreatedAt     string
+}
+
+// EventStore интерфейс для работы с событиями
+type EventStore interface {
+	Save(ctx context.Context, events []interface{}) error
+	Load(ctx context.Context, aggregateID string) ([]Event, error)
+	LoadFromVersion(ctx context.Context, aggregateID string, fromVersion int) ([]Event, error)
+}
+
+// PostgresEventStore реализация Event Store на PostgreSQL
+type PostgresEventStore struct {
+	db *sql.DB
+}
+
+func NewPostgresEventStore(db *sql.DB) *PostgresEventStore {
+	return &PostgresEventStore{db: db}
+}
+
+// Save сохраняет события в транзакции
+func (es *PostgresEventStore) Save(ctx context.Context, events []interface{}) error {
+	if len(events) == 0 {
+		return nil
+	}
+
+	tx, err := es.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	// SQL запрос для вставки события
+	query := `
+        INSERT INTO events (
+            event_id, aggregate_id, aggregate_type, event_type, 
+            event_data, metadata, version, created_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+    `
+
+	// SQL запрос для Outbox
+	outboxQuery := `
+        INSERT INTO outbox (
+            event_id, aggregate_id, event_type, event_data, published
+        ) VALUES ($1, $2, $3, $4, false)
+    `
+
+	for _, event := range events {
+		// Извлекаем базовые поля через рефлексию или type assertion
+		eventData, metadata, baseFields, err := serializeEvent(event)
+		if err != nil {
+			return fmt.Errorf("failed to serialize event: %w", err)
+		}
+
+		// Сохраняем в events таблицу
+		_, err = tx.ExecContext(ctx, query,
+			baseFields.EventID,
+			baseFields.AggregateID,
+			baseFields.AggregateType,
+			baseFields.EventType,
+			eventData,
+			metadata,
+			baseFields.Version,
+			baseFields.Timestamp,
+		)
+
+		if err != nil {
+			// Проверяем на конфликт версий (optimistic locking)
+			if isUniqueViolation(err) {
+				return errors.New("optimistic locking conflict: version already exists")
+			}
+			return fmt.Errorf("failed to insert event: %w", err)
+		}
+
+		// Сохраняем в outbox (для гарантированной публикации)
+		_, err = tx.ExecContext(ctx, outboxQuery,
+			baseFields.EventID,
+			baseFields.AggregateID,
+			baseFields.EventType,
+			eventData,
+		)
+
+		if err != nil {
+			return fmt.Errorf("failed to insert into outbox: %w", err)
+		}
+	}
+
+	// Коммит транзакции (события + outbox атомарно)
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	return nil
+}
+
+// Load загружает все события для агрегата
+func (es *PostgresEventStore) Load(ctx context.Context, aggregateID string) ([]Event, error) {
+	query := `
+        SELECT 
+            id, event_id, aggregate_id, aggregate_type, event_type,
+            event_data, metadata, version, created_at
+        FROM events
+        WHERE aggregate_id = $1
+        ORDER BY version ASC
+    `
+
+	rows, err := es.db.QueryContext(ctx, query, aggregateID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query events: %w", err)
+	}
+	defer rows.Close()
+
+	var events []Event
+	for rows.Next() {
+		var event Event
+		err := rows.Scan(
+			&event.ID,
+			&event.EventID,
+			&event.AggregateID,
+			&event.AggregateType,
+			&event.EventType,
+			&event.EventData,
+			&event.Metadata,
+			&event.Version,
+			&event.CreatedAt,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan event: %w", err)
+		}
+		events = append(events, event)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return events, nil
+}
+
+// LoadFromVersion загружает события начиная с версии
+func (es *PostgresEventStore) LoadFromVersion(
+	ctx context.Context,
+	aggregateID string,
+	fromVersion int,
+) ([]Event, error) {
+	query := `
+        SELECT 
+            id, event_id, aggregate_id, aggregate_type, event_type,
+            event_data, metadata, version, created_at
+        FROM events
+        WHERE aggregate_id = $1 AND version >= $2
+        ORDER BY version ASC
+    `
+
+	rows, err := es.db.QueryContext(ctx, query, aggregateID, fromVersion)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var events []Event
+	for rows.Next() {
+		var event Event
+		err := rows.Scan(
+			&event.ID,
+			&event.EventID,
+			&event.AggregateID,
+			&event.AggregateType,
+			&event.EventType,
+			&event.EventData,
+			&event.Metadata,
+			&event.Version,
+			&event.CreatedAt,
+		)
+		if err != nil {
+			return nil, err
+		}
+		events = append(events, event)
+	}
+
+	return events, nil
+}
