@@ -396,8 +396,6 @@ User receives: "Order failed: insufficient_liquidity"
 
 ---
 
-## 🎯 Interview Talking Points
-
 1. **Atomicity**: Events + Outbox saved in one DB transaction
 2. **Consistency**: Optimistic locking via `UNIQUE(aggregate_id, version)`
 3. **Idempotency**: Event-level, aggregate-level, business-level checks
