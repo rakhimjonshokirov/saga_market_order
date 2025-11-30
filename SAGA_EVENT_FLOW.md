@@ -1,10 +1,10 @@
-# Saga Event Flow Documentation
+# Документация по Event Flow в Saga
 
-## Event Flow Diagram
+## Диаграмма потока событий
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
-│ USER REQUEST: Create Market Order                                       │
+│ ЗАПРОС ПОЛЬЗОВАТЕЛЯ: Создать рыночный ордер                             │
 └──────────────────────┬──────────────────────────────────────────────────┘
                        │
                        ▼
@@ -19,67 +19,67 @@
         │ (order_saga.go:92-225)      │
         └──────────┬───────────────────┘
                    │
-                   ├─► [IDEMPOTENCY CHECK]
-                   │   ✓ Check if EventID already processed
-                   │   ✓ Skip if already handled
+                   ├─► [ПРОВЕРКА ИДЕМПОТЕНТНОСТИ]
+                   │   ✓ Проверка, обработан ли EventID
+                   │   ✓ Пропуск, если уже обработан
                    │
-                   ├─► [STEP 1: Price Quote]
+                   ├─► [ШАГ 1: Получение цены]
                    │   CMD: GetMarketPrice()
                    │   EVENT: PriceQuoted
                    │   AGGREGATE: Order (v2)
                    │
-                   ├─► [STEP 2: Create Position]
+                   ├─► [ШАГ 2: Создание позиции]
                    │   CMD: CreatePosition()
                    │   EVENT: PositionCreated
                    │   AGGREGATE: Position (v1)
                    │
-                   ├─► [STEP 3: Execute Swap]
+                   ├─► [ШАГ 3: Исполнение swap]
                    │   CMD: ExecuteSwap()
                    │   EVENTS: SwapExecuting → SwapExecuted
                    │   AGGREGATE: Order (v3, v4)
                    │
-                   └─► [STEP 4: Complete Order & Update Position]
+                   └─► [ШАГ 4: Завершение ордера и обновление позиции]
                        USECASE: CompleteOrderAndUpdatePositionUseCase
                        EVENTS: OrderCompleted + PositionUpdated
                        AGGREGATES: Order (v5) + Position (v2)
-                       ✓ ATOMIC TRANSACTION (both or nothing)
-                       ✓ Mark EventID as processed
+                       ✓ АТОМАРНАЯ ТРАНЗАКЦИЯ (оба или ничего)
+                       ✓ Отметка EventID как обработанного
 ```
 
 ---
 
-## Detailed Event Flow
+## Подробный разбор событий
 
-### 1. OrderAccepted Event
-**Event Name:** `OrderAccepted`
+### 1. Событие OrderAccepted
+**Название события:** `OrderAccepted`
 
-**Listener:** `handleOrderAccepted` ([order_saga.go:92](application/saga/order_saga.go#L92))
+**Слушатель:** `handleOrderAccepted` ([order_saga.go:92](application/saga/order_saga.go#L92))
 
-**What the Listener Does:**
-- Checks idempotency using `ProcessedEventsRepository`
-- Orchestrates 4-step saga workflow
-- Calls external services (PriceService, TradeWorker)
-- Executes use cases (CompleteOrderAndUpdatePositionUseCase)
+**Что делает слушатель:**
+- Проверяет идемпотентность через `ProcessedEventsRepository`
+- Оркеструет 4-шаговый Saga workflow
+- Вызывает внешние сервисы (PriceService, TradeWorker)
+- Выполняет use case (CompleteOrderAndUpdatePositionUseCase)
 
-**Aggregates Updated:**
-- **Order Aggregate** (multiple times during saga)
-- **Position Aggregate** (created and updated)
+**Обновляемые агрегаты:**
+- **Order Aggregate** (обновляется несколько раз в течение саги)
+- **Position Aggregate** (создается и обновляется)
 
-**Idempotency Guarantee:**
+**Гарантия идемпотентности:**
 ```go
-// Check if event already processed
+// Проверка, обработано ли событие
 processed, err := s.processedEvents.IsProcessed(ctx, evt.EventID)
 if processed {
-    return nil // Skip duplicate
+    return nil // Пропускаем дубликат
 }
 
-// ... saga execution ...
+// ... выполнение саги ...
 
-// Mark as processed at the end
+// Отметка как обработанного в конце
 s.processedEvents.MarkAsProcessed(ctx, evt.EventID, evt.AggregateID, evt.EventType, "order-saga")
 ```
 
-**Resulting Events:**
+**Результирующие события:**
 - `PriceQuoted`
 - `PositionCreated`
 - `SwapExecuting`
@@ -89,114 +89,114 @@ s.processedEvents.MarkAsProcessed(ctx, evt.EventID, evt.AggregateID, evt.EventTy
 
 ---
 
-### 2. PriceQuoted Event
-**Event Name:** `PriceQuoted` ([order/events.go:62](domain/order/events.go#L62))
+### 2. Событие PriceQuoted
+**Название события:** `PriceQuoted` ([order/events.go:62](domain/order/events.go#L62))
 
-**Triggered By:** `Order.QuotePrice()` method ([order_saga.go:132](application/saga/order_saga.go#L132))
+**Вызывается методом:** `Order.QuotePrice()` ([order_saga.go:132](application/saga/order_saga.go#L132))
 
-**What Happens:**
-- Order aggregate records market price and calculated toAmount
-- Order state: `pending` → `pending` (status unchanged, but enriched with price data)
+**Что происходит:**
+- Агрегат Order записывает рыночную цену и рассчитанный toAmount
+- Состояние Order: `pending` → `pending` (статус не меняется, но обогащается данными о цене)
 
-**Aggregate Updated:** Order (version incremented: v1 → v2)
+**Обновляемый агрегат:** Order (версия увеличивается: v1 → v2)
 
-**Idempotency:**
-Event sourcing ensures version control. Duplicate events rejected by optimistic locking.
-
----
-
-### 3. PositionCreated Event
-**Event Name:** `PositionCreated` ([position/events.go:29](domain/position/events.go#L29))
-
-**Triggered By:** `Position.CreatePosition()` method ([order_saga.go:146](application/saga/order_saga.go#L146))
-
-**What Happens:**
-- New position aggregate created for user
-- Initial state: `status=open`, `remainingAmount=0`
-
-**Aggregate Updated:** Position (version: v1)
-
-**Idempotency:**
-Position created with unique UUID. If saga retries, idempotency check prevents duplicate creation.
+**Идемпотентность:**
+Event sourcing гарантирует контроль версий. Дублирующиеся события отклоняются оптимистичной блокировкой.
 
 ---
 
-### 4. SwapExecuting → SwapExecuted Events
-**Event Names:** `SwapExecuting`, `SwapExecuted` ([order/events.go:74-92](domain/order/events.go#L74))
+### 3. Событие PositionCreated
+**Название события:** `PositionCreated` ([position/events.go:29](domain/position/events.go#L29))
 
-**Triggered By:**
+**Вызывается методом:** `Position.CreatePosition()` ([order_saga.go:146](application/saga/order_saga.go#L146))
+
+**Что происходит:**
+- Создается новый агрегат Position для пользователя
+- Начальное состояние: `status=open`, `remainingAmount=0`
+
+**Обновляемый агрегат:** Position (версия: v1)
+
+**Идемпотентность:**
+Position создается с уникальным UUID. При повторе саги проверка идемпотентности предотвращает дублирование.
+
+---
+
+### 4. События SwapExecuting → SwapExecuted
+**Названия событий:** `SwapExecuting`, `SwapExecuted` ([order/events.go:74-92](domain/order/events.go#L74))
+
+**Вызываются:**
 1. `Order.StartSwapExecution()` → `SwapExecuting` ([order_saga.go:163](application/saga/order_saga.go#L163))
 2. `Order.RecordSwapExecution()` → `SwapExecuted` ([order_saga.go:186](application/saga/order_saga.go#L186))
 
-**What Happens:**
-- CMD: `TradeWorker.ExecuteSwap()` with idempotency key
-- Order records swap transaction hash, executed price, fees, slippage
-- External swap executed on blockchain/DEX
+**Что происходит:**
+- CMD: `TradeWorker.ExecuteSwap()` с ключом идемпотентности
+- Order записывает хеш swap-транзакции, исполненную цену, комиссии, проскальзывание
+- Внешний swap исполняется на блокчейне/DEX
 
-**Aggregate Updated:** Order (v3 → v4)
+**Обновляемый агрегат:** Order (v3 → v4)
 
-**Idempotency:**
+**Идемпотентность:**
 ```go
 idempotencyKey := fmt.Sprintf("swap-%s", orderID)
 swapReq := SwapRequest{IdempotencyKey: idempotencyKey, ...}
 ```
-TradeWorker must implement idempotent swap execution using this key.
+TradeWorker должен реализовать идемпотентное исполнение swap с этим ключом.
 
 ---
 
-### 5. OrderCompleted + PositionUpdated (ATOMIC)
-**Event Names:** `OrderCompleted`, `PositionUpdated`
+### 5. OrderCompleted + PositionUpdated (АТОМАРНО)
+**Названия событий:** `OrderCompleted`, `PositionUpdated`
 
-**Triggered By:** `CompleteOrderAndUpdatePositionUseCase.Execute()` ([order_saga.go:199](application/saga/order_saga.go#L199))
+**Вызывается:** `CompleteOrderAndUpdatePositionUseCase.Execute()` ([order_saga.go:199](application/saga/order_saga.go#L199))
 
-**What the UseCase Does:**
-1. Loads Order aggregate → calls `CompleteOrder()` → generates `OrderCompleted` event
-2. Loads Position aggregate → calls `AddOrder()` → generates `PositionUpdated` event
-3. **Saves both events in SINGLE transaction** ([complete_order_and_update_position.go:78](application/usecases/complete_order_and_update_position.go#L78))
+**Что делает UseCase:**
+1. Загружает агрегат Order → вызывает `CompleteOrder()` → генерирует событие `OrderCompleted`
+2. Загружает агрегат Position → вызывает `AddOrder()` → генерирует событие `PositionUpdated`
+3. **Сохраняет оба события в ОДНОЙ транзакции** ([complete_order_and_update_position.go:78](application/usecases/complete_order_and_update_position.go#L78))
 
 ```go
 allEvents := append(o.Changes, p.Changes...)
-eventStore.Save(ctx, allEvents) // ATOMIC
+eventStore.Save(ctx, allEvents) // АТОМАРНО
 ```
 
-**Aggregates Updated:**
+**Обновляемые агрегаты:**
 - **Order:** v4 → v5 (status: `executing` → `completed`)
-- **Position:** v1 → v2 (adds order to position, updates remainingAmount, PnL)
+- **Position:** v1 → v2 (добавляется ордер в позицию, обновляется remainingAmount, PnL)
 
-**Idempotency Guarantee:**
-- Event Store ensures atomicity: both aggregates updated or neither
-- If saga retries after swap but before completion, idempotency check prevents re-execution
-- Event ID marked as processed AFTER successful atomic save
+**Гарантия идемпотентности:**
+- Event Store гарантирует атомарность: оба агрегата обновляются или ни один
+- Если сага повторяется после swap, но до завершения, проверка идемпотентности предотвращает повторное исполнение
+- Event ID отмечается как обработанный ПОСЛЕ успешного атомарного сохранения
 
 ---
 
-## Aggregate State Changes
+## Изменения состояния агрегатов
 
-### Order Aggregate
+### Агрегат Order
 ```
 v1: OrderAccepted      (status: pending)
-v2: PriceQuoted        (price added)
+v2: PriceQuoted        (добавлена цена)
 v3: SwapExecuting      (status: executing)
-v4: SwapExecuted       (swap details recorded)
+v4: SwapExecuted       (записаны детали swap)
 v5: OrderCompleted     (status: completed)
 ```
 
-### Position Aggregate
+### Агрегат Position
 ```
 v1: PositionCreated    (status: open, remainingAmount: 0)
-v2: PositionUpdated    (order added, remainingAmount: 0.01btc)
+v2: PositionUpdated    (добавлен ордер, remainingAmount: 0.01btc)
 ```
 
 ---
 
-## Summary Table
+## Сводная таблица
 
-| Event             | Handler/CMD                        | Aggregates Updated | Idempotency Method           |
-|-------------------|------------------------------------|--------------------|------------------------------|
-| OrderAccepted     | handleOrderAccepted (saga)         | Order, Position    | ProcessedEvents check        |
-| PriceQuoted       | Order.QuotePrice()                 | Order (v2)         | Event sourcing versioning    |
-| PositionCreated   | Position.CreatePosition()          | Position (v1)      | Event sourcing versioning    |
-| SwapExecuting     | Order.StartSwapExecution()         | Order (v3)         | Event sourcing versioning    |
-| SwapExecuted      | Order.RecordSwapExecution()        | Order (v4)         | Idempotency key on swap      |
-| OrderCompleted    | CompleteOrderAndUpdatePositionUC   | Order (v5)         | Event Store transaction      |
-| PositionUpdated   | CompleteOrderAndUpdatePositionUC   | Position (v2)      | Event Store transaction      |
+| Событие           | Обработчик/CMD                     | Обновляемые агрегаты | Метод идемпотентности        |
+|-------------------|------------------------------------|----------------------|------------------------------|
+| OrderAccepted     | handleOrderAccepted (saga)         | Order, Position      | Проверка ProcessedEvents     |
+| PriceQuoted       | Order.QuotePrice()                 | Order (v2)           | Версионирование event sourcing |
+| PositionCreated   | Position.CreatePosition()          | Position (v1)        | Версионирование event sourcing |
+| SwapExecuting     | Order.StartSwapExecution()         | Order (v3)           | Версионирование event sourcing |
+| SwapExecuted      | Order.RecordSwapExecution()        | Order (v4)           | Ключ идемпотентности swap    |
+| OrderCompleted    | CompleteOrderAndUpdatePositionUC   | Order (v5)           | Транзакция Event Store       |
+| PositionUpdated   | CompleteOrderAndUpdatePositionUC   | Position (v2)        | Транзакция Event Store       |
