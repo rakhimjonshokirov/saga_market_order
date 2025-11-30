@@ -1,0 +1,6 @@
+# Ignore all Markdown files
+*.md
+
+# But DO NOT ignore README.md
+!README.md
+!PROJECT_STRUCTURE.md
