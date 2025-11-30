@@ -152,11 +152,12 @@ func main() {
 	// =====================================================
 	// 9. API Server
 	// =====================================================
-	orderHandler := api.NewOrderHandler(createOrderUC)
+	orderHandler := api.NewOrderHandler(createOrderUC, orderRepo, es)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", api.HealthCheck)
 	mux.HandleFunc("/orders", orderHandler.CreateOrder)
+	mux.HandleFunc("/orders/", orderHandler.GetOrderHistory)
 
 	server := &http.Server{
 		Addr:    ":8080",

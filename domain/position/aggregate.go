@@ -143,4 +143,3 @@ func (p *Position) ClosePosition(reason string) error {
 
 	return p.Apply(event)
 }
-
